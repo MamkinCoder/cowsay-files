@@ -15,55 +15,110 @@ COWS=(
   "ackbar"
   "aperture-blank"
   "aperture"
+  "apt"
   "armadillo"
   "atat"
   "atom"
   "awesome-face"
+  "baby_yoda"
   "banana"
+  "bearface"
+  "beavis.zen"
   "bees"
   "bill-the-cat"
   "biohazard"
   "bishop"
   "black-mesa"
+  "blowfish"
+  "bong"
   "box"
   "broken-heart"
+  "bud-frogs"
+  "bunny"
   "cake-with-candles"
   "cake"
+  "calvin"
   "cat"
+  "cat2"
+  "catfence"
+  "charizardvice"
+  "cheese"
   "chessmen"
   "claw-arm"
   "clippy"
+  "cock"
   "companion-cube"
+  "cower"
+  "cowfee"
   "cthulhu-mini"
   "cube"
+  "daemon"
   "dalek-shooting"
   "dalek"
+  "default"
   "dolphin"
+  "dragon-and-cow"
+  "dragon"
+  "duck"
+  "elephant-in-snake"
+  "elephant"
   "elephant2"
   "explosion"
+  "eyes"
   "fat-banana"
   "fat-cow"
+  "fence"
   "fire"
+  "flaming-sheep"
+  "fox-winking"
   "fox"
+  "fox2"
   "ghost"
+  "ghostbusters2"
   "giving-bunny"
   "glados"
+  "gnu"
+  "goat"
   "golden-eagle"
   "happy-whale"
+  "head-in"
   "head"
+  "hellokitty"
+  "hippie"
+  "hiya"
   "homer"
+  "hypno"
   "jellyfish"
+  "kangaroo"
   "kilroy"
   "king"
+  "kiss"
   "kitten"
+  "kitty"
   "knight"
+  "koala"
+  "kosh"
+  "lamb"
+  "lamb2"
   "lightbulb"
+  "llama"
   "lobster"
   "lollerskates"
+  "luke-koala"
   "mailchimp"
   "maze-runner"
+  "mech-and-cow"
+  "meow"
+  "miki"
+  "milk"
+  "minotaur"
   "mona-lisa"
+  "moofasa"
+  "mooghidjirah"
+  "moojira"
+  "moose"
   "mule"
+  "mutilated"
   "nyan"
   "octopus"
   "owl"
@@ -72,31 +127,67 @@ COWS=(
   "personality-sphere"
   "pinball-machine"
   "pod"
+  "pony-smaller"
+  "pony"
+  "psychiatrichelp"
+  "psychiatrichelp2"
   "pterodactyl"
   "queen"
   "radio"
+  "ren"
   "robot"
   "robotfindskitten"
   "roflcopter"
   "rook"
+  "roz"
+  "satanic"
   "seahorse-big"
   "seahorse"
+  "sheep"
+  "shrug"
+  "skeleton"
+  "small"
   "smiling-octopus"
+  "snoopy2"
+  "snoopyhouse"
+  "snoopysleep"
+  "snowman"
+  "sodomized"
+  "spidercow"
+  "stegosaurus"
   "stick-figure"
+  "stimpy"
   "sudowoodo"
+  "supermilker"
+  "surgery"
+  "suse"
+  "tableflip"
   "taxi"
+  "telebears"
+  "three-eyes"
   "threecubes"
   "toaster"
   "tortoise"
+  "turkey"
+  "turtle"
   "tux-big"
+  "tux"
   "tweety-bird"
+  "udder"
+  "unipony-smaller"
+  "unipony"
+  "vader-koala"
+  "vader2"
   "weeping-angel"
   "whale"
   "wizard"
   "world"
+  "www"
 )
 
 PIXEL_COWS=(
+  "borat"
+  "borat_2"
   #Rick and Morty
   "rick-and-morty-running" "snowball" "pickle-rick2" "pickle-rick"
   "rick-and-morty2" "pickle-rick-face" "squanchy" "mr-pb" "plutonian" "pizza-phone"
@@ -297,10 +388,10 @@ randomsay(){
   RANDOMCOW=${COWS_DIR}/${COWS[$RAND_INDEX]}.cow
   COWTEXT=$1
 
-  if [ "$1" == "" ] ; then
+  if [ "$1" = "" ] ; then
     COWTEXT=`cat -`
   fi
-  echo $COWTEXT | cowsay -n -f $RANDOMCOW
+  echo $COWTEXT | cowsay -n -f $RANDOMCOW -W $((COLUMNS - 20))
 }
 
 pixelsay(){
@@ -309,10 +400,10 @@ pixelsay(){
   RANDOMCOW=${COWS_DIR}/${PIXEL_COWS[$RAND_INDEX]}.cow
   COWTEXT=$1
 
-  if [ "$1" == "" ] ; then
+  if [ "$1" = "" ] ; then
     COWTEXT=`cat -`
   fi
-  echo $COWTEXT | cowsay -n -f $RANDOMCOW
+  echo $COWTEXT | cowsay -n -f $RANDOMCOW -W $((COLUMNS - 20))
 }
 
 errorsay(){
@@ -321,10 +412,10 @@ errorsay(){
   RANDOMCOW=${COWS_DIR}/${ERROR_COWS[$RAND_INDEX]}.cow
   COWTEXT=$1
 
-  if [ "$1" == "" ] ; then
+  if [ "$1" = "" ] ; then
     COWTEXT=`cat -`
   fi
-  echo $COWTEXT | cowsay -n -f $RANDOMCOW
+  echo $COWTEXT | cowsay -n -f $RANDOMCOW -W $((COLUMNS - 20))
 }
 
 alias cows="cd $COWS_DIR"
@@ -332,7 +423,7 @@ alias numcows="echo ${#COWS[@]}"
 alias cowcount="numcows"
 alias cowrc="atom $COWRC"
 alias headsay='cowthink -f head.cow'
-alias randomfortune="clear && fortune | randomsay"
+alias randomfortune="fortune | randomsay"
 
 cowsay-palette(){
   for fgbg in 38 48 ; do # Foreground / Background
@@ -340,7 +431,7 @@ cowsay-palette(){
         # Display the color
         printf "\e[${fgbg};5;%sm  %3s  \e[0m" $color $color
         # Display 6 colors per lines
-        if [ $((($color + 1) % 6)) == 4 ] ; then
+        if [ $((($color + 1) % 6)) = 4 ] ; then
             echo # New line
         fi
     done
@@ -348,4 +439,42 @@ cowsay-palette(){
   done
 }
 
+# Function to print a pattern
+print_pattern() {
+  # Load patterns from the file into an array
+  PATTERNS=("${(@f)$(<"/Users/yarobala/.cowsay/patterns.txt")}")
+
+  # Ensure the array is not empty
+  if (( ${#PATTERNS[@]} == 0 )); then
+    echo "ERROR: No patterns found in the file."
+    return 1
+  fi
+
+  # Select a random pattern
+  local PATTERN="${PATTERNS[$((RANDOM % ${#PATTERNS[@]} + 1))]}"
+
+  # Ensure the pattern is not empty
+  if [[ -z "$PATTERN" ]]; then
+    echo "ERROR: Selected pattern is empty."
+    return 1
+  fi
+
+  # Adjust pattern length if necessary
+  local PATTERN_LENGTH="${#PATTERN}"
+  if (( PATTERN_LENGTH > COLUMNS )); then
+    PATTERN=${PATTERN[1,COLUMNS]} # Zsh compliant syntax for substring
+    PATTERN_LENGTH=$COLUMNS
+  fi
+
+  # Calculate how many times to repeat the pattern
+  local REPETITIONS=$((COLUMNS / PATTERN_LENGTH))
+
+  # Print the pattern
+  printf "%0.s${PATTERN}" $(seq 1 ${REPETITIONS})
+  echo
+}
+
+clear
+print_pattern | lolcat
 randomfortune
+print_pattern | lolcat
