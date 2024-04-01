@@ -163,7 +163,6 @@ COWS=(
   "suse"
   "tableflip"
   "taxi"
-  "telebears"
   "three-eyes"
   "threecubes"
   "toaster"
@@ -423,7 +422,12 @@ alias numcows="echo ${#COWS[@]}"
 alias cowcount="numcows"
 alias cowrc="atom $COWRC"
 alias headsay='cowthink -f head.cow'
-alias randomfortune="fortune | randomsay"
+if [ -n "$ITERM_SESSION_ID" ]; then
+    alias randomfortune="fortune | pixelsay"
+else
+    alias randomfortune="fortune | randomsay"
+fi
+
 
 cowsay-palette(){
   for fgbg in 38 48 ; do # Foreground / Background
@@ -475,6 +479,5 @@ print_pattern() {
 }
 
 clear
-print_pattern | lolcat
 randomfortune
 print_pattern | lolcat
