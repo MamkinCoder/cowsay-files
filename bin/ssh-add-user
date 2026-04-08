@@ -21,9 +21,12 @@ if [[ "$public_key" != ssh-* ]]; then
   exit 1
 fi
 
-public_key_b64="$(printf '%s' "$public_key" | base64)"
+public_key_b64="$(printf '%s' "$public_key" | base64 | tr -d '\r\n')"
 
-ssh -- "$host" bash -s -- "$username" "$public_key_b64" <<'REMOTE'
+ssh -tt \
+  -o PreferredAuthentications=publickey,keyboard-interactive,password \
+  -o PubkeyAuthentication=yes \
+  -- "$host" bash -s -- "$username" "$public_key_b64" <<'REMOTE'
 set -euo pipefail
 
 username="$1"
@@ -44,13 +47,22 @@ if ! id -u "$username" >/dev/null 2>&1; then
   as_root adduser --disabled-password --gecos "" "$username"
 fi
 
+user_home="$(getent passwd "$username" | cut -d: -f6)"
+if [[ -z "$user_home" ]]; then
+  print -u2 "Could not resolve home directory for user: $username"
+  exit 1
+fi
+
 as_root usermod -aG sudo "$username"
-as_root mkdir -p "/home/$username/.ssh"
-printf '%s\n' "$public_key" | as_root tee "/home/$username/.ssh/authorized_keys" >/dev/null
-as_root chmod 700 "/home/$username/.ssh"
-as_root chmod 600 "/home/$username/.ssh/authorized_keys"
-as_root chown -R "$username:$username" "/home/$username/.ssh"
+as_root mkdir -p "$user_home/.ssh"
+printf '%s\n' "$public_key" | as_root tee "$user_home/.ssh/authorized_keys" >/dev/null
+as_root chmod 700 "$user_home/.ssh"
+as_root chmod 600 "$user_home/.ssh/authorized_keys"
+as_root chown -R "$username:$username" "$user_home/.ssh"
+as_root test -s "$user_home/.ssh/authorized_keys"
+as_root mkdir -p /etc/sudoers.d
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$username" | as_root tee "/etc/sudoers.d/$username" >/dev/null
 as_root chmod 440 "/etc/sudoers.d/$username"
+as_root visudo -c >/dev/null
 as_root passwd -l "$username"
 REMOTE
