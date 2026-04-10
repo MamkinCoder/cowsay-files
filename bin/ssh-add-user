@@ -11,9 +11,9 @@ username="$2"
 key_input="$3"
 
 if [[ -f "$key_input" ]]; then
-  public_key="$(<"$key_input")"
+  public_key="$(awk '/^ssh-/{print; exit}' "$key_input" | tr -d '\r')"
 else
-  public_key="$key_input"
+  public_key="$(print -r -- "$key_input" | tr -d '\r')"
 fi
 
 if [[ "$public_key" != ssh-* ]]; then
@@ -102,3 +102,33 @@ else
   print -u2 "Warning: could not reload ssh service automatically. Reload sshd manually."
 fi
 REMOTE
+
+# End-to-end validation: confirm the new user can actually log in with public key auth.
+host_target="$host"
+if [[ "$host_target" == *@* ]]; then
+  host_target="${host_target#*@}"
+fi
+verify_target="${username}@${host_target}"
+
+verify_ssh_opts=(
+  -o BatchMode=yes
+  -o PreferredAuthentications=publickey
+  -o PubkeyAuthentication=yes
+  -o PasswordAuthentication=no
+  -o KbdInteractiveAuthentication=no
+)
+if [[ -f "$key_input" && "$key_input" == *.pub ]]; then
+  private_key="${key_input%.pub}"
+  if [[ -f "$private_key" ]]; then
+    verify_ssh_opts+=(-i "$private_key")
+  fi
+fi
+
+if ! ssh "${verify_ssh_opts[@]}" -- "$verify_target" true >/dev/null 2>&1; then
+  print -u2 "Provisioning finished, but key login verification failed for $verify_target."
+  print -u2 "Check authorized_keys content/permissions and run:"
+  print -u2 "  ssh -vvv -o PreferredAuthentications=publickey -o PasswordAuthentication=no $verify_target"
+  exit 2
+fi
+
+print "Success: key-only SSH login verified for $verify_target"
