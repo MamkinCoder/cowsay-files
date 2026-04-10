@@ -21,17 +21,15 @@ if [[ "$public_key" != ssh-* ]]; then
   exit 1
 fi
 
-public_key_b64="$(printf '%s' "$public_key" | base64 | tr -d '\r\n')"
-
-ssh -tt \
+ssh \
   -o PreferredAuthentications=publickey,keyboard-interactive,password \
   -o PubkeyAuthentication=yes \
-  -- "$host" bash -s -- "$username" "$public_key_b64" <<'REMOTE'
+  -- "$host" bash -s -- "$username" "$public_key" "$host" <<'REMOTE'
 set -euo pipefail
 
 username="$1"
-public_key_b64="$2"
-public_key="$(printf '%s' "$public_key_b64" | base64 -d)"
+public_key="$2"
+host="$3"
 
 if [[ "$(id -u)" == "0" ]]; then
   as_root() {
@@ -60,7 +58,13 @@ fi
 
 as_root usermod -aG sudo "$username"
 as_root mkdir -p "$user_home/.ssh"
-printf '%s\n' "$public_key" | as_root tee "$user_home/.ssh/authorized_keys" >/dev/null
+
+# Ensure key exists exactly once without clobbering existing keys.
+as_root touch "$user_home/.ssh/authorized_keys"
+if ! as_root grep -Fxq -- "$public_key" "$user_home/.ssh/authorized_keys"; then
+  printf '%s\n' "$public_key" | as_root tee -a "$user_home/.ssh/authorized_keys" >/dev/null
+fi
+
 as_root chmod 700 "$user_home/.ssh"
 as_root chmod 600 "$user_home/.ssh/authorized_keys"
 as_root chown -R "$username:$username" "$user_home/.ssh"
@@ -70,4 +74,31 @@ printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$username" | as_root tee "/etc/sudoers.d/$
 as_root chmod 440 "/etc/sudoers.d/$username"
 as_root visudo -c >/dev/null
 as_root passwd -l "$username"
+
+# Enforce key-only SSH auth for this specific user.
+as_root mkdir -p /etc/ssh/sshd_config.d
+cat <<EOF | as_root tee "/etc/ssh/sshd_config.d/99-${username}-keyonly.conf" >/dev/null
+Match User ${username}
+  PasswordAuthentication no
+  KbdInteractiveAuthentication no
+  PubkeyAuthentication yes
+  AuthenticationMethods publickey
+EOF
+
+# Validate config and reload SSH daemon.
+if as_root command -v sshd >/dev/null 2>&1; then
+  as_root sshd -t
+elif as_root test -x /usr/sbin/sshd; then
+  as_root /usr/sbin/sshd -t
+else
+  print -u2 "Warning: sshd binary not found; skipping sshd config validation."
+fi
+
+if as_root command -v systemctl >/dev/null 2>&1; then
+  as_root systemctl reload ssh 2>/dev/null || as_root systemctl reload sshd
+elif as_root command -v service >/dev/null 2>&1; then
+  as_root service ssh reload 2>/dev/null || as_root service sshd reload
+else
+  print -u2 "Warning: could not reload ssh service automatically. Reload sshd manually."
+fi
 REMOTE
