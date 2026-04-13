@@ -2,14 +2,13 @@
 set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
-  printf '%s\n' "Usage: ssh-add-user <host> <username> <ssh-public-key-or-.pub-file> [private-key-for-verify]" >&2
+  printf '%s\n' "Usage: ssh-add-user <host> <username> <ssh-public-key-or-.pub-file>" >&2
   exit 1
 fi
 
 host="$1"
 username="$2"
 key_input="$3"
-verify_private_key="${4:-}"
 
 if [ -f "$key_input" ]; then
   public_key="$(awk '/^ssh-/{print; exit}' "$key_input" | tr -d '\r')"
@@ -153,62 +152,4 @@ else
 fi
 REMOTE
 
-# End-to-end validation: confirm the new user can actually log in with public key auth.
-host_target="$host"
-if [[ "$host_target" == *@* ]]; then
-  host_target="${host_target#*@}"
-fi
-verify_target="${username}@${host_target}"
-
-verify_ssh_opts=(
-  -o BatchMode=yes
-  -o PreferredAuthentications=publickey
-  -o PubkeyAuthentication=yes
-  -o PasswordAuthentication=no
-  -o KbdInteractiveAuthentication=no
-)
-
-verify_mode="auto"
-if [[ -n "$verify_private_key" ]]; then
-  if [[ -f "$verify_private_key" ]]; then
-    verify_ssh_opts+=(-i "$verify_private_key")
-    verify_mode="explicit-key"
-  else
-    printf '%s\n' "Warning: verify private key path does not exist: $verify_private_key" >&2
-    verify_mode="skip"
-  fi
-elif [[ -f "$key_input" && "$key_input" == *.pub ]]; then
-  private_key="${key_input%.pub}"
-  if [[ -f "$private_key" ]]; then
-    verify_ssh_opts+=(-i "$private_key")
-    verify_mode="derived-key"
-  else
-    verify_mode="agent-only"
-  fi
-else
-  # Inline public key: we cannot reliably infer private key path.
-  # Avoid false negatives from unrelated default identities.
-  verify_mode="skip"
-fi
-
-if [[ "$verify_mode" == "skip" ]]; then
-  printf '%s\n' "Provisioning finished for $verify_target." >&2
-  printf '%s\n' "Skipped automatic login verification (no private key path available)." >&2
-  printf '%s\n' "To verify manually with the right key, run:" >&2
-  printf '%s\n' "  ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no ${verify_target}" >&2
-  exit 0
-fi
-
-if ! ssh "${verify_ssh_opts[@]}" -- "$verify_target" true >/dev/null 2>&1; then
-  if [[ "$verify_mode" == "agent-only" ]]; then
-    printf '%s\n' "Provisioning finished for $verify_target, but automatic verification failed with current default identities." >&2
-    printf '%s\n' "Pass a private key path as 4th argument to verify explicitly, e.g.:" >&2
-    printf '%s\n' "  ssh-add-user \"$host\" \"$username\" \"$key_input\" /path/to/private/key" >&2
-  fi
-  printf '%s\n' "Provisioning finished, but key login verification failed for $verify_target." >&2
-  printf '%s\n' "Check authorized_keys content/permissions and run:" >&2
-  printf '%s\n' "  ssh -vvv -o PreferredAuthentications=publickey -o PasswordAuthentication=no $verify_target" >&2
-  exit 2
-fi
-
-printf '%s\n' "Success: key-only SSH login verified for $verify_target"
+printf '%s\n' "Success: user provisioned and SSH key installed for $username on $host"
