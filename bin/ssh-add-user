@@ -1,8 +1,8 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 3 ]]; then
-  print -u2 "Usage: ssh-add-user <host> <username> <ssh-public-key-or-.pub-file>"
+if [ "$#" -lt 3 ]; then
+  printf '%s\n' "Usage: ssh-add-user <host> <username> <ssh-public-key-or-.pub-file>" >&2
   exit 1
 fi
 
@@ -10,35 +10,65 @@ host="$1"
 username="$2"
 key_input="$3"
 
-if [[ -f "$key_input" ]]; then
+if [ -f "$key_input" ]; then
   public_key="$(awk '/^ssh-/{print; exit}' "$key_input" | tr -d '\r')"
 else
-  public_key="$(print -r -- "$key_input" | tr -d '\r')"
+  public_key="$(printf '%s' "$key_input" | tr -d '\r')"
 fi
 
-if [[ "$public_key" != ssh-* ]]; then
-  print -u2 "Expected an SSH public key or path to a .pub file"
+# Validate full SSH public key shape: "algorithm payload [comment]".
+if ! awk 'NF >= 2 && $1 ~ /^ssh-/ && length($2) > 40 {ok=1} END {exit(ok ? 0 : 1)}' <<<"$public_key"; then
+  printf '%s\n' "Expected a full SSH public key or path to a .pub file" >&2
   exit 1
 fi
+
+public_key_b64="$(printf '%s' "$public_key" | base64 | tr -d '\n')"
 
 ssh \
   -o PreferredAuthentications=publickey,keyboard-interactive,password \
   -o PubkeyAuthentication=yes \
-  -- "$host" bash -s -- "$username" "$public_key" "$host" <<'REMOTE'
+  -- "$host" bash -s -- "$username" "$host" "$public_key_b64" <<'REMOTE'
 set -euo pipefail
 
 username="$1"
-public_key="$2"
-host="$3"
+host="$2"
+public_key_b64="$3"
 
-if [[ "$(id -u)" == "0" ]]; then
+decode_b64() {
+  if command -v base64 >/dev/null 2>&1; then
+    if base64 --decode </dev/null >/dev/null 2>&1; then
+      base64 --decode
+      return
+    elif base64 -d </dev/null >/dev/null 2>&1; then
+      base64 -d
+      return
+    fi
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import base64,sys;sys.stdout.write(base64.b64decode(sys.stdin.read()).decode())'
+    return
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    openssl base64 -d -A
+    return
+  fi
+
+  printf '%s\n' "No base64 decoder found on remote host." >&2
+  exit 1
+}
+
+public_key="$(printf '%s' "$public_key_b64" | decode_b64)"
+
+if [ "$(id -u)" = "0" ]; then
   as_root() {
     "$@"
   }
 else
   if ! sudo -n true >/dev/null 2>&1; then
-    print -u2 "Passwordless sudo is required on $host for this script."
-    print -u2 "Configure NOPASSWD for your current SSH user or connect as root."
+    printf '%s\n' "Passwordless sudo is required on $host for this script." >&2
+    printf '%s\n' "Configure NOPASSWD for your current SSH user or connect as root." >&2
     exit 1
   fi
   as_root() {
@@ -47,16 +77,35 @@ else
 fi
 
 if ! id -u "$username" >/dev/null 2>&1; then
-  as_root adduser --disabled-password --gecos "" "$username"
+  if as_root command -v adduser >/dev/null 2>&1; then
+    if as_root adduser --help 2>&1 | grep -q -- '--disabled-password'; then
+      as_root adduser --disabled-password --gecos "" "$username"
+    else
+      as_root adduser "$username"
+    fi
+  elif as_root command -v useradd >/dev/null 2>&1; then
+    as_root useradd -m -s /bin/bash "$username"
+  else
+    printf '%s\n' "Neither adduser nor useradd found on remote host." >&2
+    exit 1
+  fi
 fi
 
-user_home="$(getent passwd "$username" | cut -d: -f6)"
-if [[ -z "$user_home" ]]; then
-  print -u2 "Could not resolve home directory for user: $username"
+if command -v getent >/dev/null 2>&1; then
+  user_home="$(getent passwd "$username" | cut -d: -f6)"
+else
+  user_home="$(grep "^${username}:" /etc/passwd | cut -d: -f6)"
+fi
+if [ -z "$user_home" ]; then
+  printf '%s\n' "Could not resolve home directory for user: $username" >&2
   exit 1
 fi
 
-as_root usermod -aG sudo "$username"
+if as_root getent group sudo >/dev/null 2>&1; then
+  as_root usermod -aG sudo "$username"
+elif as_root getent group wheel >/dev/null 2>&1; then
+  as_root usermod -aG wheel "$username"
+fi
 as_root mkdir -p "$user_home/.ssh"
 
 # Ensure key exists exactly once without clobbering existing keys.
@@ -91,7 +140,7 @@ if as_root command -v sshd >/dev/null 2>&1; then
 elif as_root test -x /usr/sbin/sshd; then
   as_root /usr/sbin/sshd -t
 else
-  print -u2 "Warning: sshd binary not found; skipping sshd config validation."
+  printf '%s\n' "Warning: sshd binary not found; skipping sshd config validation." >&2
 fi
 
 if as_root command -v systemctl >/dev/null 2>&1; then
@@ -99,7 +148,7 @@ if as_root command -v systemctl >/dev/null 2>&1; then
 elif as_root command -v service >/dev/null 2>&1; then
   as_root service ssh reload 2>/dev/null || as_root service sshd reload
 else
-  print -u2 "Warning: could not reload ssh service automatically. Reload sshd manually."
+  printf '%s\n' "Warning: could not reload ssh service automatically. Reload sshd manually." >&2
 fi
 REMOTE
 
@@ -125,10 +174,10 @@ if [[ -f "$key_input" && "$key_input" == *.pub ]]; then
 fi
 
 if ! ssh "${verify_ssh_opts[@]}" -- "$verify_target" true >/dev/null 2>&1; then
-  print -u2 "Provisioning finished, but key login verification failed for $verify_target."
-  print -u2 "Check authorized_keys content/permissions and run:"
-  print -u2 "  ssh -vvv -o PreferredAuthentications=publickey -o PasswordAuthentication=no $verify_target"
+  printf '%s\n' "Provisioning finished, but key login verification failed for $verify_target." >&2
+  printf '%s\n' "Check authorized_keys content/permissions and run:" >&2
+  printf '%s\n' "  ssh -vvv -o PreferredAuthentications=publickey -o PasswordAuthentication=no $verify_target" >&2
   exit 2
 fi
 
-print "Success: key-only SSH login verified for $verify_target"
+printf '%s\n' "Success: key-only SSH login verified for $verify_target"
