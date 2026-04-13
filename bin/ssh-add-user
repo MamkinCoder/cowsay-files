@@ -76,14 +76,19 @@ else
   }
 fi
 
+as_root_has_cmd() {
+  as_root env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH" \
+    sh -c 'command -v "$1" >/dev/null 2>&1' sh "$1"
+}
+
 if ! id -u "$username" >/dev/null 2>&1; then
-  if as_root command -v adduser >/dev/null 2>&1; then
+  if as_root_has_cmd adduser; then
     if as_root adduser --help 2>&1 | grep -q -- '--disabled-password'; then
       as_root adduser --disabled-password --gecos "" "$username"
     else
       as_root adduser "$username"
     fi
-  elif as_root command -v useradd >/dev/null 2>&1; then
+  elif as_root_has_cmd useradd; then
     as_root useradd -m -s /bin/bash "$username"
   else
     printf '%s\n' "Neither adduser nor useradd found on remote host." >&2
@@ -101,9 +106,9 @@ if [ -z "$user_home" ]; then
   exit 1
 fi
 
-if as_root getent group sudo >/dev/null 2>&1; then
+if as_root sh -c 'getent group sudo >/dev/null 2>&1 || grep -q "^sudo:" /etc/group'; then
   as_root usermod -aG sudo "$username"
-elif as_root getent group wheel >/dev/null 2>&1; then
+elif as_root sh -c 'getent group wheel >/dev/null 2>&1 || grep -q "^wheel:" /etc/group'; then
   as_root usermod -aG wheel "$username"
 fi
 as_root mkdir -p "$user_home/.ssh"
@@ -135,7 +140,7 @@ Match User ${username}
 EOF
 
 # Validate config and reload SSH daemon.
-if as_root command -v sshd >/dev/null 2>&1; then
+if as_root_has_cmd sshd; then
   as_root sshd -t
 elif as_root test -x /usr/sbin/sshd; then
   as_root /usr/sbin/sshd -t
@@ -143,9 +148,9 @@ else
   printf '%s\n' "Warning: sshd binary not found; skipping sshd config validation." >&2
 fi
 
-if as_root command -v systemctl >/dev/null 2>&1; then
+if as_root_has_cmd systemctl; then
   as_root systemctl reload ssh 2>/dev/null || as_root systemctl reload sshd
-elif as_root command -v service >/dev/null 2>&1; then
+elif as_root_has_cmd service; then
   as_root service ssh reload 2>/dev/null || as_root service sshd reload
 else
   printf '%s\n' "Warning: could not reload ssh service automatically. Reload sshd manually." >&2
