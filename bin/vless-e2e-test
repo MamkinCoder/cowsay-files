@@ -1,0 +1,870 @@
+#!/bin/zsh
+set -euo pipefail
+
+REMOTE_HOST="${REMOTE_HOST:-${VPN_MASTER_HOST:-vpn-master}}"
+XRAY_BIN="${XRAY_BIN:-xray}"
+LOCAL_PORT="${LOCAL_PORT:-20880}"
+REMOTE_PORT="${REMOTE_PORT:-20881}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-25}"
+MIN_BYTES="${MIN_BYTES:-1024}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-8}"
+LOW_SPEED_TIME="${LOW_SPEED_TIME:-10}"
+LOW_SPEED_LIMIT="${LOW_SPEED_LIMIT:-32768}"
+ALLOW_IP_MISMATCH="${ALLOW_IP_MISMATCH:-0}"
+IP_CHECK_URL="https://2ip.io/"
+DOWNLOAD_10MB_URL="https://speed.cloudflare.com/__down?bytes=10485760"
+DOWNLOAD_10MB_BYTES=10485760
+REMOTE_AUTO_INSTALL_DEPS="${REMOTE_AUTO_INSTALL_DEPS:-1}"
+REMOTE_XRAY_BIN="$XRAY_BIN"
+
+usage() {
+  cat <<EOF
+Usage:
+  vless-e2e-test 'vless://...'
+  vless-e2e-test 'https://.../dynamic_config?...'
+  printf '%s\n' 'vless://...' | vless-e2e-test
+  curl -fsSL 'https://.../dynamic_config?...' | vless-e2e-test
+
+Input:
+  - A single VLESS URI
+  - Multiple VLESS URIs separated by newlines
+  - A URL returning dynamic config content that contains VLESS URIs
+
+Environment:
+  REMOTE_HOST       SSH host for remote test (default: vpn-master)
+                    Legacy alias still works: VPN_MASTER_HOST
+  XRAY_BIN          Local xray binary name/path (default: xray)
+  LOCAL_PORT        Local temporary SOCKS port (default: 20880)
+  REMOTE_PORT       Remote temporary SOCKS port (default: 20881)
+  CURL_MAX_TIME     curl timeout in seconds (default: 25)
+  MIN_BYTES         Minimum bytes that must download to count as PASS (default: 1024)
+  CONNECT_TIMEOUT   curl connect timeout in seconds (default: 8)
+  LOW_SPEED_TIME    Fail if speed stays below LOW_SPEED_LIMIT this many seconds (default: 10)
+  LOW_SPEED_LIMIT   Minimum sustained bytes/sec before curl aborts as too slow (default: 32768)
+  ALLOW_IP_MISMATCH Run 10MB test even when exit IP mismatches expected host/IP (default: 0)
+  REMOTE_AUTO_INSTALL_DEPS
+                    Auto-install missing remote deps if possible (default: 1)
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+  INPUT="$1"
+else
+  INPUT="$(cat)"
+fi
+INPUT="$(printf '%s' "${INPUT:-}" | tr -d '\r')"
+
+if [[ -z "${INPUT//[$' \t\n']}" ]]; then
+  echo "input is required" >&2
+  exit 1
+fi
+
+for cmd in "$XRAY_BIN" python3 ssh curl; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "required command not found: $cmd" >&2
+    exit 1
+  fi
+done
+
+TMP_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+extract_vless_lines() {
+  awk '
+    {
+      gsub(/\r/, "", $0)
+      sub(/^[[:space:]]+/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      if ($0 ~ /^vless:\/\//) {
+        print $0
+      }
+    }
+  '
+}
+
+resolve_input_to_uris() {
+  local raw="$1"
+  local source_file="$TMP_DIR/source.txt"
+  printf '%s\n' "$raw" >"$source_file"
+
+  if [[ "$raw" == http://* || "$raw" == https://* ]]; then
+    curl --fail --silent --show-error --location "$raw" >"$TMP_DIR/fetched.txt"
+    extract_vless_lines <"$TMP_DIR/fetched.txt" >"$TMP_DIR/uris.txt"
+    return
+  fi
+
+  extract_vless_lines <"$source_file" >"$TMP_DIR/uris.txt"
+}
+
+resolve_input_to_uris "$INPUT"
+
+if [[ ! -s "$TMP_DIR/uris.txt" ]]; then
+  echo "no vless uris found in input" >&2
+  exit 1
+fi
+
+build_outbound() {
+  local uri="$1"
+  export VLESS_URI="$uri"
+  python3 >"$TMP_DIR/outbound.json" <<'PY'
+import json
+import os
+import urllib.parse
+import uuid
+
+uri = os.environ["VLESS_URI"].strip()
+parsed = urllib.parse.urlparse(uri)
+if parsed.scheme != "vless":
+    raise SystemExit("uri must start with vless://")
+if not parsed.username or not parsed.hostname or parsed.port is None:
+    raise SystemExit("uri must include uuid, host and port")
+uuid.UUID(parsed.username)
+
+query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+def q(name, default=""):
+    values = query.get(name)
+    if not values:
+        return default
+    return values[0]
+
+security = q("security", "reality")
+if security != "reality":
+    raise SystemExit(f"unsupported security {security!r}; expected reality")
+
+network = q("type", "tcp")
+flow = q("flow", "")
+fingerprint = q("fp", "chrome")
+public_key = q("pbk", "")
+server_name = q("sni", "")
+sid = q("sid", "")
+spx = q("spx", "")
+path = q("path", "")
+mode = q("mode", "")
+
+if not public_key:
+    raise SystemExit("pbk is required")
+if not server_name:
+    raise SystemExit("sni is required")
+
+outbound = {
+    "protocol": "vless",
+    "settings": {
+        "vnext": [
+            {
+                "address": parsed.hostname,
+                "port": parsed.port,
+                "users": [
+                    {
+                        "id": parsed.username,
+                        "encryption": q("encryption", "none"),
+                    }
+                ],
+            }
+        ]
+    },
+    "streamSettings": {
+        "network": network,
+        "security": "reality",
+        "realitySettings": {
+            "serverName": server_name,
+            "fingerprint": fingerprint,
+            "publicKey": public_key,
+        },
+    },
+}
+
+if flow:
+    outbound["settings"]["vnext"][0]["users"][0]["flow"] = flow
+if sid:
+    outbound["streamSettings"]["realitySettings"]["shortId"] = sid
+if spx:
+    outbound["streamSettings"]["realitySettings"]["spiderX"] = spx
+if network == "xhttp":
+    xhttp = {}
+    if path:
+        xhttp["path"] = path
+    if mode:
+        xhttp["mode"] = mode
+    if xhttp:
+        outbound["streamSettings"]["xhttpSettings"] = xhttp
+
+print(json.dumps(outbound, indent=2))
+PY
+}
+
+build_config() {
+  local port="$1"
+  python3 - "$port" "$TMP_DIR/outbound.json" >"$TMP_DIR/config-$port.json" <<'PY'
+import json
+import pathlib
+import sys
+
+port = int(sys.argv[1])
+outbound = json.loads(pathlib.Path(sys.argv[2]).read_text())
+config = {
+    "log": {"loglevel": "debug"},
+    "inbounds": [
+        {
+            "listen": "127.0.0.1",
+            "port": port,
+            "protocol": "socks",
+            "settings": {"udp": False},
+        }
+    ],
+    "outbounds": [outbound],
+}
+print(json.dumps(config, indent=2))
+PY
+}
+
+parse_uri_metadata() {
+  local uri="$1"
+  python3 - "$uri" <<'PY'
+import sys
+import urllib.parse
+
+uri = sys.argv[1]
+parsed = urllib.parse.urlparse(uri)
+label = urllib.parse.unquote(parsed.fragment) if parsed.fragment else "(no label)"
+query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+def q(name, default=""):
+    values = query.get(name)
+    if not values:
+        return default
+    return values[0]
+
+print(label)
+print(parsed.hostname or "")
+print(parsed.port or "")
+print(q("sni", ""))
+print(q("pbk", ""))
+print((parsed.hostname or "").strip("[]"))
+PY
+}
+
+extract_ip_from_2ip() {
+  local html_file="$1"
+  python3 - "$html_file" <<'PY'
+import pathlib
+import re
+import sys
+
+html = pathlib.Path(sys.argv[1]).read_text(errors="ignore")
+patterns = [
+    r'IPv4[^0-9]{0,80}((?:\d{1,3}\.){3}\d{1,3})',
+    r'Ваш IP[^0-9]{0,80}((?:\d{1,3}\.){3}\d{1,3})',
+    r'Your IP[^0-9]{0,80}((?:\d{1,3}\.){3}\d{1,3})',
+    r'((?:\d{1,3}\.){3}\d{1,3})',
+]
+for pattern in patterns:
+    match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+    if match:
+        print(match.group(1))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+extract_2ip_challenge_cookies() {
+  local html_file="$1"
+  python3 - "$html_file" <<'PY'
+import base64
+import pathlib
+import re
+import sys
+
+html = pathlib.Path(sys.argv[1]).read_text(errors="ignore")
+match = re.search(r'atob\("([A-Za-z0-9+/=]+)"\)', html)
+if not match:
+    raise SystemExit(1)
+decoded = base64.b64decode(match.group(1)).decode(errors="ignore")
+answer = re.search(r'const answer = "([^"]+)"', decoded)
+salt = re.search(r'const salt = "([^"]+)"', decoded)
+if not answer or not salt:
+    raise SystemExit(1)
+print(f"{salt.group(1)}|{answer.group(1)}")
+PY
+}
+
+curl_2ip_once() {
+  local socks_port="$1"
+  local curl_out="$2"
+  local curl_err="$3"
+  local curl_meta="$4"
+  local cookie_header="${5:-}"
+
+  local -a curl_cmd
+  curl_cmd=(
+    curl --silent --show-error --location --max-time "$CURL_MAX_TIME"
+    --connect-timeout "$CONNECT_TIMEOUT"
+    --speed-time "$LOW_SPEED_TIME"
+    --speed-limit "$LOW_SPEED_LIMIT"
+    --socks5-hostname "127.0.0.1:${socks_port}"
+    -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+    -H "Accept-Language: en-US,en;q=0.9"
+    -H "Upgrade-Insecure-Requests: 1"
+    --output "$curl_out"
+    --write-out '%{size_download}|%{speed_download}|%{time_total}|%{remote_ip}\n'
+  )
+  if [[ -n "$cookie_header" ]]; then
+    curl_cmd+=(-b "$cookie_header")
+  fi
+  curl_cmd+=("$IP_CHECK_URL")
+
+  local curl_rc=0
+  "${curl_cmd[@]}" >"$curl_meta" 2>"$curl_err" || curl_rc=$?
+  return $curl_rc
+}
+
+probe_script() {
+  cat <<'EOF'
+set -euo pipefail
+tmp_dir="$(mktemp -d /tmp/vless-e2e.XXXXXX)"
+cfg="$tmp_dir/config.json"
+log="$tmp_dir/xray.log"
+curl_out="$tmp_dir/curl.out"
+curl_err="$tmp_dir/curl.err"
+curl_meta="$tmp_dir/curl.meta"
+dl_out="$tmp_dir/dl.out"
+dl_err="$tmp_dir/dl.err"
+dl_meta="$tmp_dir/dl.meta"
+pid=""
+cleanup() {
+  if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT INT TERM
+python3 - "$CONFIG_JSON_B64" "$cfg" <<'PY'
+import base64, pathlib, sys
+pathlib.Path(sys.argv[2]).write_text(base64.b64decode(sys.argv[1]).decode())
+PY
+compact_file() { tr '\n' ' ' <"$1" | sed 's/[[:space:]]\+/ /g'; }
+extract_ip() {
+  python3 - "$1" <<'PY'
+import pathlib, re, sys
+html = pathlib.Path(sys.argv[1]).read_text(errors="ignore")
+for p in [
+    r'IPv4[^0-9]{0,80}((?:\d{1,3}\.){3}\d{1,3})',
+    r'Ваш IP[^0-9]{0,80}((?:\d{1,3}\.){3}\d{1,3})',
+    r'Your IP[^0-9]{0,80}((?:\d{1,3}\.){3}\d{1,3})',
+    r'((?:\d{1,3}\.){3}\d{1,3})',
+]:
+    m = re.search(p, html, re.IGNORECASE | re.DOTALL)
+    if m:
+        print(m.group(1))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+extract_2ip_challenge() {
+  python3 - "$1" <<'PY'
+import base64, pathlib, re, sys
+html = pathlib.Path(sys.argv[1]).read_text(errors="ignore")
+m = re.search(r'atob\("([A-Za-z0-9+/=]+)"\)', html)
+if not m:
+    raise SystemExit(1)
+decoded = base64.b64decode(m.group(1)).decode(errors="ignore")
+answer = re.search(r'const answer = "([^"]+)"', decoded)
+salt = re.search(r'const salt = "([^"]+)"', decoded)
+if not answer or not salt:
+    raise SystemExit(1)
+print(f"{salt.group(1)}|{answer.group(1)}")
+PY
+}
+curl_ip() {
+  local cookie="${1:-}" rc=0
+  local -a cmd=(
+    curl --silent --show-error --location --max-time "$CURL_MAX_TIME"
+    --connect-timeout "$CONNECT_TIMEOUT"
+    --speed-time "$LOW_SPEED_TIME"
+    --speed-limit "$LOW_SPEED_LIMIT"
+    --socks5-hostname "127.0.0.1:${SOCKS_PORT}"
+    -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+    -H "Accept-Language: en-US,en;q=0.9"
+    -H "Upgrade-Insecure-Requests: 1"
+    --output "$curl_out"
+    --write-out '%{size_download}|%{speed_download}|%{time_total}|%{remote_ip}\n'
+  )
+  [[ -n "$cookie" ]] && cmd+=(-b "$cookie")
+  cmd+=("$IP_CHECK_URL")
+  "${cmd[@]}" >"$curl_meta" 2>"$curl_err" || rc=$?
+  return $rc
+}
+emit_result() {
+  local status="$1" ip_check="$2" dl="$3" ip="$4" ip_bytes="$5" ip_speed="$6" ip_time="$7" dl_bytes="$8" dl_speed="$9" dl_time="${10}" detail="${11}"
+  local xray_log
+  xray_log="$(compact_file "$log")"
+  if [[ "$status" == "MISMATCH" && "$ALLOW_IP_MISMATCH" == "1" ]]; then
+    if [[ "$dl" == "PASS" ]]; then
+      printf 'PASS|ip_check=%s|download_10mb=PASS|ip=%s|ip_bytes=%s|ip_speed=%sB/s|ip_time=%ss|dl_bytes=%s|dl_speed=%sB/s|dl_time=%ss|detail=%s|xray=%s\n' "$ip_check" "$ip" "$ip_bytes" "$ip_speed" "$ip_time" "$dl_bytes" "$dl_speed" "$dl_time" "$detail" "$xray_log"
+    else
+      printf 'PARTIAL|ip_check=%s|download_10mb=%s|ip=%s|ip_bytes=%s|ip_speed=%sB/s|ip_time=%ss|dl_bytes=%s|dl_speed=%sB/s|dl_time=%ss|detail=%s|xray=%s\n' "$ip_check" "$dl" "$ip" "$ip_bytes" "$ip_speed" "$ip_time" "$dl_bytes" "$dl_speed" "$dl_time" "$detail" "$xray_log"
+    fi
+    return
+  fi
+  if [[ "$status" == "PASS" && "$dl" == "PASS" ]]; then
+    printf 'PASS|ip_check=PASS|download_10mb=PASS|ip=%s|ip_bytes=%s|ip_speed=%sB/s|ip_time=%ss|dl_bytes=%s|dl_speed=%sB/s|dl_time=%ss\n' "$ip" "$ip_bytes" "$ip_speed" "$ip_time" "$dl_bytes" "$dl_speed" "$dl_time"
+  elif [[ "$status" == "PASS" ]]; then
+    printf 'PARTIAL|ip_check=PASS|download_10mb=%s|ip=%s|ip_bytes=%s|ip_speed=%sB/s|ip_time=%ss|dl_bytes=%s|dl_speed=%sB/s|dl_time=%ss|detail=%s|xray=%s\n' "$dl" "$ip" "$ip_bytes" "$ip_speed" "$ip_time" "$dl_bytes" "$dl_speed" "$dl_time" "$detail" "$xray_log"
+  elif [[ "$status" == "MISMATCH" ]]; then
+    printf 'PARTIAL|ip_check=%s|download_10mb=SKIP|ip=%s|ip_bytes=%s|ip_speed=%sB/s|ip_time=%ss|dl_bytes=%s|dl_speed=%sB/s|dl_time=%ss|detail=%s|xray=%s\n' "$ip_check" "$ip" "$ip_bytes" "$ip_speed" "$ip_time" "$dl_bytes" "$dl_speed" "$dl_time" "$detail" "$xray_log"
+  else
+    printf 'FAIL|ip_check=FAIL|download_10mb=SKIP|detail=%s|xray=%s\n' "$detail" "$xray_log"
+  fi
+}
+"$XRAY_BIN" run -c "$cfg" >"$log" 2>&1 &
+pid=$!
+sleep 3
+curl_rc=0
+challenge=""
+curl_ip || curl_rc=$?
+if [[ $curl_rc -eq 0 ]] && challenge="$(extract_2ip_challenge "$curl_out" 2>/dev/null)"; then
+  IFS='|' read -r challenge_salt challenge_answer <<<"$challenge"
+  curl_rc=0
+  curl_ip "2ip_js_challenge_salt=${challenge_salt}; 2ip_js_challenge=${challenge_answer}" || curl_rc=$?
+fi
+status="FAIL"
+ip_check="FAIL"
+download_status="SKIP"
+detail=""
+size_download=0
+speed_download=0
+time_total=0
+detected_ip=""
+dl_bytes=0
+dl_speed=0
+dl_time=0
+if [[ $curl_rc -eq 0 ]]; then
+  IFS='|' read -r size_download speed_download time_total reported_remote_ip <"$curl_meta" || true
+  [[ -z "$size_download" ]] && size_download=0
+  if detected_ip="$(extract_ip "$curl_out" 2>/dev/null)" && [[ "$size_download" -ge "$MIN_BYTES" ]]; then
+    if [[ "$detected_ip" == "$EXPECTED_IP" ]]; then
+      status="PASS"
+      ip_check="PASS"
+    else
+      status="MISMATCH"
+      ip_check="MISMATCH"
+      detail="ip mismatch: got=$detected_ip expected=$EXPECTED_IP"
+    fi
+  elif [[ "$size_download" -lt "$MIN_BYTES" ]]; then
+    detail="2ip download too small: bytes=$size_download < min=$MIN_BYTES"
+  else
+    detail="could not extract ip from 2ip response (bytes=$size_download)"
+  fi
+else
+  detail="2ip curl failed: $(compact_file "$curl_err")"
+fi
+if [[ "$status" == "PASS" || ( "$status" == "MISMATCH" && "$ALLOW_IP_MISMATCH" == "1" ) ]]; then
+  dl_rc=0
+  curl --silent --show-error --location --max-time "$CURL_MAX_TIME" \
+    --connect-timeout "$CONNECT_TIMEOUT" \
+    --speed-time "$LOW_SPEED_TIME" \
+    --speed-limit "$LOW_SPEED_LIMIT" \
+    --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+    --output "$dl_out" \
+    --write-out '%{size_download}|%{speed_download}|%{time_total}\n' \
+    "$DOWNLOAD_10MB_URL" >"$dl_meta" 2>"$dl_err" || dl_rc=$?
+  if [[ $dl_rc -eq 0 ]]; then
+    IFS='|' read -r dl_bytes dl_speed dl_time <"$dl_meta" || true
+    [[ -z "$dl_bytes" ]] && dl_bytes=0
+    if [[ "$dl_bytes" -ge "$DOWNLOAD_10MB_BYTES" ]]; then
+      download_status="PASS"
+    else
+      download_status="FAIL"
+      detail="10mb download too small: bytes=$dl_bytes < need=$DOWNLOAD_10MB_BYTES"
+    fi
+  else
+    download_status="FAIL"
+    detail="10mb curl failed: $(compact_file "$dl_err")"
+  fi
+fi
+emit_result "$status" "$ip_check" "$download_status" "$detected_ip" "$size_download" "$speed_download" "$time_total" "$dl_bytes" "$dl_speed" "$dl_time" "$detail"
+EOF
+}
+
+run_local_probe() {
+  local expected_ip="$1"
+  local config_b64
+  config_b64="$(base64 <"$TMP_DIR/config-$LOCAL_PORT.json" | tr -d '\n')"
+  probe_script | env \
+    CONFIG_JSON_B64="$config_b64" \
+    XRAY_BIN="$XRAY_BIN" \
+    SOCKS_PORT="$LOCAL_PORT" \
+    EXPECTED_IP="$expected_ip" \
+    CURL_MAX_TIME="$CURL_MAX_TIME" \
+    MIN_BYTES="$MIN_BYTES" \
+    CONNECT_TIMEOUT="$CONNECT_TIMEOUT" \
+    LOW_SPEED_TIME="$LOW_SPEED_TIME" \
+    LOW_SPEED_LIMIT="$LOW_SPEED_LIMIT" \
+    ALLOW_IP_MISMATCH="$ALLOW_IP_MISMATCH" \
+    IP_CHECK_URL="$IP_CHECK_URL" \
+    DOWNLOAD_10MB_URL="$DOWNLOAD_10MB_URL" \
+    DOWNLOAD_10MB_BYTES="$DOWNLOAD_10MB_BYTES" \
+    bash
+}
+
+run_remote_probe() {
+  local expected_ip="$1"
+  local ssh_out="$TMP_DIR/remote-result.txt"
+  local ssh_err="$TMP_DIR/remote-result.err"
+  local config_b64
+
+  if ! ssh -n -o BatchMode=yes "$REMOTE_HOST" "test -x '$REMOTE_XRAY_BIN'"; then
+    printf 'FAIL|ssh|remote xray binary not available: %s\n' "$REMOTE_XRAY_BIN"
+    return 1
+  fi
+
+  config_b64="$(base64 <"$TMP_DIR/config-$REMOTE_PORT.json" | tr -d '\n')"
+
+  if ! probe_script | ssh -T -o BatchMode=yes "$REMOTE_HOST" \
+    "CONFIG_JSON_B64='$config_b64' XRAY_BIN='$REMOTE_XRAY_BIN' SOCKS_PORT='$REMOTE_PORT' EXPECTED_IP='$expected_ip' CURL_MAX_TIME='$CURL_MAX_TIME' MIN_BYTES='$MIN_BYTES' CONNECT_TIMEOUT='$CONNECT_TIMEOUT' LOW_SPEED_TIME='$LOW_SPEED_TIME' LOW_SPEED_LIMIT='$LOW_SPEED_LIMIT' ALLOW_IP_MISMATCH='$ALLOW_IP_MISMATCH' IP_CHECK_URL='$IP_CHECK_URL' DOWNLOAD_10MB_URL='$DOWNLOAD_10MB_URL' DOWNLOAD_10MB_BYTES='$DOWNLOAD_10MB_BYTES' bash -s" \
+    >"$ssh_out" 2>"$ssh_err"; then
+    printf 'FAIL|ssh|%s|stderr|%s\n' \
+      "$(tr '\n' ' ' <"$ssh_out" | sed 's/[[:space:]]\+/ /g')" \
+      "$(tr '\n' ' ' <"$ssh_err" | sed 's/[[:space:]]\+/ /g')"
+    return 1
+  fi
+
+  cat "$ssh_out"
+}
+
+kv_get() {
+  local line="$1"
+  local key="$2"
+  local part
+  local -a parts
+  IFS='|' read -r -A parts <<<"$line"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == "${key}="* ]]; then
+      printf '%s\n' "${part#${key}=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+status_rank() {
+  case "$1" in
+    PASS) echo 0 ;;
+    PARTIAL) echo 1 ;;
+    FAIL) echo 2 ;;
+    *) echo 3 ;;
+  esac
+}
+
+min_status() {
+  local a="$1"
+  local b="$2"
+  if [[ "$(status_rank "$a")" -ge "$(status_rank "$b")" ]]; then
+    echo "$a"
+  else
+    echo "$b"
+  fi
+}
+
+ensure_remote_dependencies() {
+  local prep_out="$TMP_DIR/remote-prepare.out"
+  local prep_err="$TMP_DIR/remote-prepare.err"
+
+  if ! ssh -T -o BatchMode=yes "$REMOTE_HOST" \
+    "REMOTE_XRAY_BIN='$XRAY_BIN' REMOTE_AUTO_INSTALL_DEPS='$REMOTE_AUTO_INSTALL_DEPS' bash -s" <<'EOF' >"$prep_out" 2>"$prep_err"; then
+set -euo pipefail
+
+REMOTE_XRAY_BIN="${REMOTE_XRAY_BIN:-xray}"
+REMOTE_AUTO_INSTALL_DEPS="${REMOTE_AUTO_INSTALL_DEPS:-1}"
+
+can_sudo() {
+  command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1
+}
+
+install_pkg() {
+  local pkg="$1"
+  if [[ "$REMOTE_AUTO_INSTALL_DEPS" != "1" ]]; then
+    return 1
+  fi
+  if ! can_sudo; then
+    return 1
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo -n apt-get update -y >/dev/null 2>&1 || true
+    sudo -n apt-get install -y "$pkg" >/dev/null
+    return $?
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    sudo -n dnf install -y "$pkg" >/dev/null
+    return $?
+  fi
+  if command -v yum >/dev/null 2>&1; then
+    sudo -n yum install -y "$pkg" >/dev/null
+    return $?
+  fi
+  if command -v apk >/dev/null 2>&1; then
+    sudo -n apk add --no-cache "$pkg" >/dev/null
+    return $?
+  fi
+  return 1
+}
+
+ensure_cmd() {
+  local cmd="$1"
+  local pkg="$2"
+  command -v "$cmd" >/dev/null 2>&1 && return 0
+  install_pkg "$pkg" || return 1
+  command -v "$cmd" >/dev/null 2>&1
+}
+
+if ! ensure_cmd curl curl; then
+  echo "missing dependency on remote: curl"
+  exit 10
+fi
+if ! ensure_cmd python3 python3; then
+  echo "missing dependency on remote: python3"
+  exit 11
+fi
+
+xray_path=""
+if command -v "$REMOTE_XRAY_BIN" >/dev/null 2>&1; then
+  xray_path="$(command -v "$REMOTE_XRAY_BIN")"
+elif command -v xray >/dev/null 2>&1; then
+  xray_path="$(command -v xray)"
+fi
+
+if [[ -z "$xray_path" ]]; then
+  if [[ "$REMOTE_AUTO_INSTALL_DEPS" != "1" ]]; then
+    echo "missing dependency on remote: xray"
+    exit 12
+  fi
+  tmp_dir="$(mktemp -d /tmp/vless-xray.XXXXXX)"
+  cleanup_tmp() { rm -rf "$tmp_dir"; }
+  trap cleanup_tmp EXIT
+
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) pkg="Xray-linux-64.zip" ;;
+    aarch64|arm64) pkg="Xray-linux-arm64-v8a.zip" ;;
+    *)
+      echo "unsupported remote architecture for xray auto-install: $arch"
+      exit 13
+      ;;
+  esac
+
+  curl -fsSL "https://github.com/XTLS/Xray-core/releases/latest/download/$pkg" -o "$tmp_dir/xray.zip"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$tmp_dir/xray.zip" -d "$tmp_dir"
+  elif command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xf "$tmp_dir/xray.zip" -C "$tmp_dir"
+  else
+    ensure_cmd python3 python3 || true
+    python3 - "$tmp_dir/xray.zip" "$tmp_dir" <<'PY'
+import sys
+import zipfile
+
+zip_path = sys.argv[1]
+out_dir = sys.argv[2]
+with zipfile.ZipFile(zip_path, "r") as zf:
+    zf.extractall(out_dir)
+PY
+  fi
+
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmp_dir/xray" "$HOME/.local/bin/xray"
+  xray_path="$HOME/.local/bin/xray"
+fi
+
+echo "READY|xray_bin=$xray_path"
+EOF
+    printf 'remote dependency prepare failed on host=%s: %s\n' \
+      "$REMOTE_HOST" "$(tr '\n' ' ' <"$prep_err" | sed 's/[[:space:]]\+/ /g')" >&2
+    if [[ -s "$prep_out" ]]; then
+      printf 'remote output: %s\n' "$(tr '\n' ' ' <"$prep_out" | sed 's/[[:space:]]\+/ /g')" >&2
+    fi
+    exit 1
+  fi
+
+  local ready_line
+  ready_line="$(head -n1 "$prep_out")"
+  if [[ "$ready_line" != READY\|xray_bin=* ]]; then
+    printf 'unexpected remote dependency prepare output on host=%s: %s\n' \
+      "$REMOTE_HOST" "$(tr '\n' ' ' <"$prep_out" | sed 's/[[:space:]]\+/ /g')" >&2
+    exit 1
+  fi
+  REMOTE_XRAY_BIN="${ready_line#READY|xray_bin=}"
+}
+
+report_result() {
+  local label="$1"
+  local host="$2"
+  local port="$3"
+  local sni="$4"
+  local pbk="$5"
+  local local_result="$6"
+  local remote_result="$7"
+
+  local local_status="${local_result%%|*}"
+  local remote_status="${remote_result%%|*}"
+
+  local local_ip local_ip_bytes local_dl_status local_dl_bytes local_detail
+  local remote_ip remote_ip_bytes remote_dl_status remote_dl_bytes remote_detail
+
+  local_ip="$(kv_get "$local_result" "ip" 2>/dev/null || true)"
+  local_ip_bytes="$(kv_get "$local_result" "ip_bytes" 2>/dev/null || true)"
+  local_dl_status="$(kv_get "$local_result" "download_10mb" 2>/dev/null || true)"
+  local_dl_bytes="$(kv_get "$local_result" "dl_bytes" 2>/dev/null || true)"
+  local_detail="$(kv_get "$local_result" "detail" 2>/dev/null || true)"
+
+  remote_ip="$(kv_get "$remote_result" "ip" 2>/dev/null || true)"
+  remote_ip_bytes="$(kv_get "$remote_result" "ip_bytes" 2>/dev/null || true)"
+  remote_dl_status="$(kv_get "$remote_result" "download_10mb" 2>/dev/null || true)"
+  remote_dl_bytes="$(kv_get "$remote_result" "dl_bytes" 2>/dev/null || true)"
+  remote_detail="$(kv_get "$remote_result" "detail" 2>/dev/null || true)"
+
+  echo "## $label"
+  echo "endpoint: ${host}:${port}"
+  echo "sni: $sni"
+  echo "pbk: ${pbk:0:12}..."
+  echo "local: $local_status (ip=${local_ip:-n/a}; ip_bytes=${local_ip_bytes:-0}; download_10mb=${local_dl_status:-n/a}; dl_bytes=${local_dl_bytes:-0})"
+  if [[ "$local_status" != "PASS" && -n "$local_detail" ]]; then
+    echo "  detail: $local_detail"
+  fi
+  echo "${REMOTE_HOST}: $remote_status (ip=${remote_ip:-n/a}; ip_bytes=${remote_ip_bytes:-0}; download_10mb=${remote_dl_status:-n/a}; dl_bytes=${remote_dl_bytes:-0})"
+  if [[ "$remote_status" != "PASS" && -n "$remote_detail" ]]; then
+    echo "  detail: $remote_detail"
+  fi
+  echo
+}
+
+print_summary_group() {
+  local title="$1"
+  shift
+
+  echo "$title"
+  if [[ $# -eq 0 ]]; then
+    echo "  - none"
+    return
+  fi
+
+  local item
+  for item in "$@"; do
+    echo "  - $item"
+  done
+}
+
+total=0
+passed_local=0
+partial_local=0
+failed_local=0
+passed_remote=0
+partial_remote=0
+failed_remote=0
+typeset -a local_ok_labels
+typeset -a local_partial_labels
+typeset -a local_fail_labels
+typeset -a remote_ok_labels
+typeset -a remote_partial_labels
+typeset -a remote_fail_labels
+typeset -a both_ok_labels
+typeset -a both_partial_labels
+typeset -a both_fail_labels
+report_file="$TMP_DIR/report.txt"
+: >"$report_file"
+
+ensure_remote_dependencies
+
+while IFS= read -r VLESS_URI; do
+  [[ -n "$VLESS_URI" ]] || continue
+  total=$((total + 1))
+
+  build_outbound "$VLESS_URI"
+  build_config "$LOCAL_PORT"
+  build_config "$REMOTE_PORT"
+
+  metadata="$(parse_uri_metadata "$VLESS_URI")"
+  label="$(printf '%s\n' "$metadata" | sed -n '1p')"
+  host="$(printf '%s\n' "$metadata" | sed -n '2p')"
+  port="$(printf '%s\n' "$metadata" | sed -n '3p')"
+  sni="$(printf '%s\n' "$metadata" | sed -n '4p')"
+  pbk="$(printf '%s\n' "$metadata" | sed -n '5p')"
+  expected_ip="$(printf '%s\n' "$metadata" | sed -n '6p')"
+
+  set +e
+  local_result="$(run_local_probe "$expected_ip")"
+  local_rc=$?
+  remote_result="$(run_remote_probe "$expected_ip")"
+  remote_rc=$?
+  set -e
+
+  local_status="${local_result%%|*}"
+  remote_status="${remote_result%%|*}"
+
+  if [[ $local_rc -eq 0 && "$local_status" == "PASS" ]]; then
+    passed_local=$((passed_local + 1))
+    local_ok_labels+=("$label")
+  elif [[ $local_rc -eq 0 && "$local_status" == "PARTIAL" ]]; then
+    partial_local=$((partial_local + 1))
+    local_partial_labels+=("$label")
+  else
+    failed_local=$((failed_local + 1))
+    local_fail_labels+=("$label")
+  fi
+  if [[ $remote_rc -eq 0 && "$remote_status" == "PASS" ]]; then
+    passed_remote=$((passed_remote + 1))
+    remote_ok_labels+=("$label")
+  elif [[ $remote_rc -eq 0 && "$remote_status" == "PARTIAL" ]]; then
+    partial_remote=$((partial_remote + 1))
+    remote_partial_labels+=("$label")
+  else
+    failed_remote=$((failed_remote + 1))
+    remote_fail_labels+=("$label")
+  fi
+
+  combined_status="$(min_status "$local_status" "$remote_status")"
+  if [[ $local_rc -eq 0 && $remote_rc -eq 0 && "$combined_status" == "PASS" ]]; then
+    both_ok_labels+=("$label")
+  elif [[ $local_rc -eq 0 && $remote_rc -eq 0 && "$combined_status" == "PARTIAL" ]]; then
+    both_partial_labels+=("$label")
+  else
+    both_fail_labels+=("$label")
+  fi
+
+  report_result "$label" "$host" "$port" "$sni" "$pbk" "$local_result" "$remote_result" | tee -a "$report_file"
+done <"$TMP_DIR/uris.txt"
+
+{
+  echo "==== Summary ===="
+  echo "local: pass=${passed_local}/${total}, partial=${partial_local}/${total}, fail=${failed_local}/${total}"
+  echo "${REMOTE_HOST}: pass=${passed_remote}/${total}, partial=${partial_remote}/${total}, fail=${failed_remote}/${total}"
+  echo "both: pass=${#both_ok_labels[@]}/${total}, partial=${#both_partial_labels[@]}/${total}, fail=${#both_fail_labels[@]}/${total}"
+  echo
+  print_summary_group "Worked locally:" "${local_ok_labels[@]}"
+  echo
+  print_summary_group "Partial locally:" "${local_partial_labels[@]}"
+  echo
+  print_summary_group "Failed locally:" "${local_fail_labels[@]}"
+  echo
+  print_summary_group "Worked on ${REMOTE_HOST}:" "${remote_ok_labels[@]}"
+  echo
+  print_summary_group "Partial on ${REMOTE_HOST}:" "${remote_partial_labels[@]}"
+  echo
+  print_summary_group "Failed on ${REMOTE_HOST}:" "${remote_fail_labels[@]}"
+  echo
+  print_summary_group "Worked on both local and ${REMOTE_HOST}:" "${both_ok_labels[@]}"
+  echo
+  print_summary_group "Partial on both sides:" "${both_partial_labels[@]}"
+  echo
+  print_summary_group "Did not work on both sides:" "${both_fail_labels[@]}"
+} | tee -a "$report_file"
