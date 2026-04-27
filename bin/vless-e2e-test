@@ -353,6 +353,59 @@ import base64, pathlib, sys
 pathlib.Path(sys.argv[2]).write_text(base64.b64decode(sys.argv[1]).decode())
 PY
 compact_file() { tr '\n' ' ' <"$1" | sed 's/[[:space:]]\+/ /g'; }
+detect_xray_issue() {
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+log = pathlib.Path(sys.argv[1]).read_text(errors="ignore")
+compact = " ".join(log.split())
+lower = compact.lower()
+
+checks = [
+    (
+        "reality/sni mismatch: server returned real certificate; likely wrong sni, wrong public key, wrong short id, or broken reality inbound",
+        [
+            "reality: received real certificate",
+            "reality: processed invalid connection",
+        ],
+    ),
+    (
+        "reality short id mismatch: client sid likely does not match server shortIds",
+        [
+            "shortid",
+            "short id",
+        ],
+    ),
+    (
+        "reality public key mismatch: client pbk likely does not match server private key",
+        [
+            "invalid request version",
+            "invalid handshake",
+        ],
+    ),
+]
+
+for message, needles in checks:
+    if all(needle in lower for needle in needles):
+        print(message)
+        raise SystemExit(0)
+
+if "reality: received real certificate" in lower:
+    print("reality/sni mismatch: server returned real certificate; likely wrong sni, wrong public key, wrong short id, or broken reality inbound")
+    raise SystemExit(0)
+
+if "shortid" in lower or "short id" in lower:
+    print("reality short id mismatch: client sid likely does not match server shortIds")
+    raise SystemExit(0)
+
+if "failed to find an available destination" in lower and "proxy/vless/outbound" in lower:
+    print("vless outbound failed before tunnel establishment; inspect xray log for handshake mismatch")
+    raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
 extract_ip() {
   python3 - "$1" <<'PY'
 import pathlib, re, sys
@@ -468,6 +521,16 @@ if [[ $curl_rc -eq 0 ]]; then
   fi
 else
   detail="2ip curl failed: $(compact_file "$curl_err")"
+fi
+if [[ "$status" == "FAIL" ]]; then
+  xray_issue="$(detect_xray_issue "$log" 2>/dev/null || true)"
+  if [[ -n "$xray_issue" ]]; then
+    if [[ -n "$detail" ]]; then
+      detail="${xray_issue}; ${detail}"
+    else
+      detail="$xray_issue"
+    fi
+  fi
 fi
 if [[ "$status" == "PASS" || ( "$status" == "MISMATCH" && "$ALLOW_IP_MISMATCH" == "1" ) ]]; then
   dl_rc=0

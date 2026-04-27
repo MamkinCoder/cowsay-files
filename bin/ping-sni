@@ -1,0 +1,213 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# Usage:
+#   ./ping-sni.zsh www.google.com cloudflare.com example.com
+#   cat sni-list.txt | ./ping-sni.zsh
+#
+# Input format:
+#   one host per arg or stdin
+#   blank lines and lines starting with # are ignored
+
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-15}"
+PORT="${PORT:-443}"
+
+GREEN="🟢"
+RED="🔴"
+FLAG_PASS="✅"
+FLAG_FAIL="❌"
+
+log() {
+  print -r -- "$*" >&2
+}
+
+need_tool() {
+  local tool="$1"
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    log "❌ missing required tool: $tool"
+    exit 1
+  fi
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$seconds" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$seconds" "$@"
+  else
+    "$@"
+  fi
+}
+
+trim_host() {
+  local host="$1"
+
+  # trim whitespace
+  host="${host#"${host%%[![:space:]]*}"}"
+  host="${host%"${host##*[![:space:]]}"}"
+
+  # strip protocol/path if pasted accidentally
+  host="${host#https://}"
+  host="${host#http://}"
+  host="${host%%/*}"
+
+  # strip port if present, but keep simple hostnames/IPs usable
+  host="${host%%:*}"
+
+  print -r -- "$host"
+}
+
+resolve_prefers_ipv4() {
+  local host="$1"
+
+  if command -v getent >/dev/null 2>&1 && getent ahostsv4 "$host" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
+check_tls13() {
+  local host="$1"
+  local ip_arg=()
+
+  if resolve_prefers_ipv4 "$host"; then
+    ip_arg=(-4)
+  fi
+
+  run_with_timeout "$TIMEOUT_SECONDS" \
+    openssl s_client "${ip_arg[@]}" \
+      -connect "${host}:${PORT}" \
+      -servername "$host" \
+      -tls1_3 </dev/null 2>/dev/null \
+    | grep -q "TLSv1.3"
+}
+
+check_http2() {
+  local host="$1"
+  local ip_arg=()
+
+  if resolve_prefers_ipv4 "$host"; then
+    ip_arg=(-4)
+  fi
+
+  curl "${ip_arg[@]}" \
+    -sI \
+    --http2 \
+    --connect-timeout 8 \
+    --max-time "$TIMEOUT_SECONDS" \
+    "https://${host}" 2>/dev/null \
+    | grep -q '^HTTP/2'
+}
+
+check_san() {
+  local host="$1"
+  local ip_arg=()
+
+  if resolve_prefers_ipv4 "$host"; then
+    ip_arg=(-4)
+  fi
+
+  local san_list
+  san_list="$(
+    run_with_timeout "$TIMEOUT_SECONDS" \
+      openssl s_client "${ip_arg[@]}" \
+        -connect "${host}:${PORT}" \
+        -servername "$host" </dev/null 2>/dev/null \
+      | openssl x509 -noout -ext subjectAltName 2>/dev/null \
+      || true
+  )"
+
+  print -r -- "$san_list" | grep -Fqi "$host"
+}
+
+check_host() {
+  local host="$1"
+
+  local tls="FAIL"
+  local h2="FAIL"
+  local san="FAIL"
+  local final="FAIL"
+
+  if check_tls13 "$host"; then
+    tls="PASS"
+  fi
+
+  if check_http2 "$host"; then
+    h2="PASS"
+  fi
+
+  if check_san "$host"; then
+    san="PASS"
+  fi
+
+  if [[ "$tls" == "PASS" && "$h2" == "PASS" && "$san" == "PASS" ]]; then
+    final="PASS"
+  fi
+
+  local icon="$RED"
+  local flag="$FLAG_FAIL"
+
+  if [[ "$final" == "PASS" ]]; then
+    icon="$GREEN"
+    flag="$FLAG_PASS"
+  fi
+
+  printf "%-3s %-3s %-38s tls13=%-4s h2=%-4s san=%-4s final=%s\n" \
+    "$icon" "$flag" "$host" "$tls" "$h2" "$san" "$final"
+}
+
+main() {
+  need_tool openssl
+  need_tool curl
+  need_tool grep
+
+  local hosts=()
+
+  if (( $# > 0 )); then
+    hosts=("$@")
+  else
+    while IFS= read -r line; do
+      hosts+=("$line")
+    done
+  fi
+
+  print -r -- "🌐 ping-sni check"
+  print -r -- "port=${PORT} timeout=${TIMEOUT_SECONDS}s"
+  print -r -- ""
+
+  local pass_count=0
+  local fail_count=0
+
+  for raw in "${hosts[@]}"; do
+    local host
+    host="$(trim_host "$raw")"
+
+    [[ -z "$host" ]] && continue
+    [[ "$host" == \#* ]] && continue
+
+    local result
+    result="$(check_host "$host")"
+    print -r -- "$result"
+
+    if print -r -- "$result" | grep -q "final=PASS"; then
+      (( pass_count++ ))
+    else
+      (( fail_count++ ))
+    fi
+  done
+
+  print -r -- ""
+  print -r -- "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  print -r -- "🟢 pass: $pass_count"
+  print -r -- "🔴 fail: $fail_count"
+
+  if (( fail_count > 0 )); then
+    exit 1
+  fi
+}
+
+main "$@"
