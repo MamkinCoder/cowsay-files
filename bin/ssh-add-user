@@ -60,10 +60,11 @@ decode_b64() {
 }
 
 public_key="$(printf '%s' "$public_key_b64" | decode_b64)"
+root_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 if [ "$(id -u)" = "0" ]; then
   as_root() {
-    "$@"
+    env PATH="$root_path" "$@"
   }
 else
   if ! sudo -n true >/dev/null 2>&1; then
@@ -72,13 +73,12 @@ else
     exit 1
   fi
   as_root() {
-    sudo -n "$@"
+    sudo -n env PATH="$root_path" "$@"
   }
 fi
 
 as_root_has_cmd() {
-  as_root env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH" \
-    sh -c 'command -v "$1" >/dev/null 2>&1' sh "$1"
+  as_root sh -c 'command -v "$1" >/dev/null 2>&1' sh "$1"
 }
 
 if ! id -u "$username" >/dev/null 2>&1; then
@@ -126,7 +126,11 @@ as_root test -s "$user_home/.ssh/authorized_keys"
 as_root mkdir -p /etc/sudoers.d
 printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$username" | as_root tee "/etc/sudoers.d/$username" >/dev/null
 as_root chmod 440 "/etc/sudoers.d/$username"
-as_root visudo -c >/dev/null
+if as_root_has_cmd visudo; then
+  as_root visudo -c >/dev/null
+else
+  printf '%s\n' "Warning: visudo not found; skipping sudoers validation." >&2
+fi
 as_root passwd -l "$username"
 
 # Enforce key-only SSH auth for this specific user.
