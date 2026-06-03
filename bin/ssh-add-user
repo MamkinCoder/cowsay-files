@@ -81,6 +81,24 @@ as_root_has_cmd() {
   as_root sh -c 'command -v "$1" >/dev/null 2>&1' sh "$1"
 }
 
+ensure_sudo() {
+  if as_root_has_cmd sudo; then
+    return
+  fi
+
+  if as_root_has_cmd apt-get; then
+    as_root apt-get update
+    as_root apt-get install -y sudo
+    return
+  fi
+
+  printf '%s\n' "sudo is not installed on $host, and this script only auto-installs it on apt-based systems." >&2
+  printf '%s\n' "Install sudo manually or connect as root and provision it first." >&2
+  exit 1
+}
+
+ensure_sudo
+
 if ! id -u "$username" >/dev/null 2>&1; then
   if as_root_has_cmd adduser; then
     if as_root adduser --help 2>&1 | grep -q -- '--disabled-password'; then
